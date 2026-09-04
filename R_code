@@ -595,15 +595,39 @@ make_spatial_map <- function(crop_name, dataset_tag, country_detail) {
     p
   }
 
+  # Gomulu lejant: "Not in full-sample" (gri kutu) + "CR undefined" (capraz-cizgili kutu)
+  # dogrudan gorselin icine ciziliyor -- sembol aciklamasi captionda degil, artworkda olmali
+  LEGEND_X0 <- -170; LEGEND_X1 <- -145
+  LEGEND_Y_GRAY <- -50; LEGEND_Y_HATCH <- -62
+  SWATCH_H <- 7
+  hatch_swatch_poly <- data.frame(
+    long = c(LEGEND_X0, LEGEND_X1, LEGEND_X1, LEGEND_X0),
+    lat  = c(LEGEND_Y_HATCH, LEGEND_Y_HATCH, LEGEND_Y_HATCH + SWATCH_H, LEGEND_Y_HATCH + SWATCH_H),
+    group = 1
+  )
+  hatch_lines_legend <- make_hatch_lines(hatch_swatch_poly, spacing = 1.8)
+
+  add_legend_box <- function(p) {
+    p +
+      annotate("rect", xmin = LEGEND_X0, xmax = LEGEND_X1, ymin = LEGEND_Y_GRAY, ymax = LEGEND_Y_GRAY + SWATCH_H,
+                fill = "gray90", color = "gray40", linewidth = 0.2) +
+      annotate("rect", xmin = LEGEND_X0, xmax = LEGEND_X1, ymin = LEGEND_Y_HATCH, ymax = LEGEND_Y_HATCH + SWATCH_H,
+                fill = "gray90", color = "gray40", linewidth = 0.2) +
+      geom_segment(data = hatch_lines_legend, aes(x = x, xend = xend, y = y, yend = yend),
+                   color = "gray40", linewidth = 0.25, inherit.aes = FALSE) +
+      annotate("text", x = LEGEND_X1 + 3, y = LEGEND_Y_GRAY + SWATCH_H / 2, label = "Not in full-sample", hjust = 0, size = 2.6) +
+      annotate("text", x = LEGEND_X1 + 3, y = LEGEND_Y_HATCH + SWATCH_H / 2, label = "CR undefined", hjust = 0, size = 2.6)
+  }
+
   p_labeled <- ggplot(merged, aes(x = long, y = lat, group = group, fill = CR)) +
     geom_polygon(color = "gray60", linewidth = 0.1) +
     scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
                           midpoint = 1, na.value = "gray90")
-  p_labeled <- add_hatching(p_labeled) +
+  p_labeled <- add_hatching(p_labeled)
+  p_labeled <- add_legend_box(p_labeled) +
     coord_fixed(1.3) +
     labs(
       title = sprintf("Country-level concurrence ratio map: %s (%s)", crop_name, dataset_tag),
-      subtitle = "Red = CR above 1, blue = CR below 1, plain gray = not in sample, hatched gray = CR undefined (null mean = 0)",
       fill = "CR"
     ) +
     theme_minimal(base_size = 12) +
@@ -613,7 +637,8 @@ make_spatial_map <- function(crop_name, dataset_tag, country_detail) {
     geom_polygon(color = "gray60", linewidth = 0.1) +
     scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
                           midpoint = 1, na.value = "gray90")
-  p_unlabeled <- add_hatching(p_unlabeled) +
+  p_unlabeled <- add_hatching(p_unlabeled)
+  p_unlabeled <- add_legend_box(p_unlabeled) +
     coord_fixed(1.3) +
     labs(fill = "CR") +
     theme_minimal(base_size = 12) +
