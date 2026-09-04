@@ -1,0 +1,1263 @@
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(sp)
+
+set.seed(2026)
+
+base_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+crops <- c("wheat","maize","rice","barley","oats","rye","sorghum","soybean")
+out_dir <- file.path(base_dir, "record_montecarlo", "results")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+B_pooled <- 10000
+YEAR_START <- 1961
+YEAR_END <- 2024
+
+crop_colors <- c(
+  wheat   = "#08519C",
+  barley  = "#3182BD",
+  oats    = "#6BAED6",
+  rye     = "#9ECAE1",
+  rice    = "#A63603",
+  maize   = "#E6550D",
+  soybean = "#FD8D3C",
+  sorghum = "#FDBE85"
+)
+
+perm_pvalue <- function(null_dist, observed) {
+  (1 + sum(null_dist >= observed)) / (1 + length(null_dist))
+}
+
+count_records <- function(x, type = c("upper", "lower")) {
+  type <- match.arg(type)
+  n <- length(x)
+  rec <- integer(n)
+  rec[1] <- 1L
+  running <- x[1]
+  if (type == "upper") {
+    for (t in 2:n) if (x[t] > running) { rec[t] <- 1L; running <- x[t] }
+  } else {
+    for (t in 2:n) if (x[t] < running) { rec[t] <- 1L; running <- x[t] }
+  }
+  rec
+}
+
+circular_shift_null <- function(temp_series, yield_series, n_shift) {
+  n <- length(temp_series)
+  rec_yield <- count_records(yield_series, "lower")
+  rec_yield[1] <- 0L
+  null_counts <- integer(n_shift)
+  for (i in seq_len(n_shift)) {
+    temp_shift <- temp_series[((seq_len(n) - 1 + i) %% n) + 1]
+    rec_temp_shift <- count_records(temp_shift, "upper")
+    rec_temp_shift[1] <- 0L
+    null_counts[i] <- sum(rec_temp_shift * rec_yield)
+  }
+  null_counts
+}
+
+block_shift_null <- function(temp_series, yield_series, block_length, n_reps) {
+  n <- length(temp_series)
+  rec_yield <- count_records(yield_series, "lower")
+  rec_yield[1] <- 0L
+  n_blocks <- ceiling(n / block_length)
+  null_counts <- integer(n_reps)
+  for (r in seq_len(n_reps)) {
+    starts <- sample(seq_len(n), n_blocks, replace = TRUE)
+    idx <- unlist(lapply(starts, function(s) ((s - 1 + 0:(block_length - 1)) %% n) + 1))
+    idx <- idx[seq_len(n)]
+    temp_shuffled <- temp_series[idx]
+    rec_temp_shuffled <- count_records(temp_shuffled, "upper")
+    rec_temp_shuffled[1] <- 0L
+    null_counts[r] <- sum(rec_temp_shuffled * rec_yield)
+  }
+  null_counts
+}
+
+read_raw_crop <- function(crop, base_dir) {
+  path <- file.path(base_dir, sprintf("panelv7_%s.xlsx", crop))
+  raw <- as.data.frame(read_excel(path))
+  raw <- raw[, c("Country_ISO", "Yil", "yield_hg_per_ha", "TMX_ann")]
+  raw[order(raw$Country_ISO, raw$Yil), ]
+}
+
+filter_crop_data <- function(raw, min_years, year_start, year_end) {
+  full_years <- year_start:year_end
+  country_list <- unique(raw$Country_ISO)
+  keep_countries <- character(0)
+
+  for (ctry in country_list) {
+    sub <- raw[raw$Country_ISO == ctry, ]
+    if (nrow(sub) < min_years) next
+    if (any(is.na(sub$yield_hg_per_ha)) || any(is.na(sub$TMX_ann))) next
+    if (min_years >= length(full_years)) {
+      if (!all(full_years %in% sub$Yil)) next
+    }
+    keep_countries <- c(keep_countries, ctry)
+  }
+
+  raw[raw$Country_ISO %in% keep_countries, ]
+}
+
+run_crop <- function(df, crop, B_pooled) {
+  obs_list <- numeric(0)
+  null_list <- list()
+  country_rows <- data.frame()
+
+  for (ctry in unique(df$Country_ISO)) {
+    sub <- df[df$Country_ISO == ctry, ]
+    yield_raw <- sub$yield_hg_per_ha
+    temp_raw <- sub$TMX_ann
+    n_years <- length(yield_raw)
+    if (n_years < 10) next
+    t_index <- seq_along(yield_raw)
+
+    yield_detrend <- residuals(lm(yield_raw ~ t_index))
+
+    rec_temp <- count_records(temp_raw, "upper")
+    rec_yield_raw <- count_records(yield_raw, "lower")
+    rec_yield_detrend <- count_records(yield_detrend, "lower")
+
+    rec_temp_conc <- rec_temp; rec_temp_conc[1] <- 0L
+    rec_yield_raw_conc <- rec_yield_raw; rec_yield_raw_conc[1] <- 0L
+    rec_yield_detrend_conc <- rec_yield_detrend; rec_yield_detrend_conc[1] <- 0L
+
+    obs_raw <- sum(rec_temp_conc * rec_yield_raw_conc)
+    obs_detrend <- sum(rec_temp_conc * rec_yield_detrend_conc)
+
+    nulldist <- circular_shift_null(temp_raw, yield_detrend, n_shift = n_years - 1)
+
+    obs_list <- c(obs_list, obs_detrend)
+    null_list[[ctry]] <- nulldist
+
+    null_mean_val <- mean(nulldist)
+    CR_val <- if (null_mean_val > 0) obs_detrend / null_mean_val else NA_real_
+
+    country_rows <- rbind(country_rows, data.frame(
+      crop = crop,
+      country = ctry,
+      n_years = n_years,
+      yield_records_raw = sum(rec_yield_raw),
+      yield_records_detrend = sum(rec_yield_detrend),
+      temp_records = sum(rec_temp),
+      concurrence_raw = obs_raw,
+      concurrence_detrend = obs_detrend,
+      null_mean = null_mean_val,
+      CR = CR_val,
+      p_value = perm_pvalue(nulldist, obs_detrend)
+    ))
+  }
+
+  country_rows$p_FDR <- p.adjust(country_rows$p_value, method = "BH")
+
+  observed_total <- sum(obs_list)
+  pooled_null <- numeric(B_pooled)
+  for (b in seq_len(B_pooled)) {
+    total_b <- 0
+    for (ctry in names(null_list)) total_b <- total_b + sample(null_list[[ctry]], 1)
+    pooled_null[b] <- total_b
+  }
+
+  crop_summary <- data.frame(
+    crop = crop,
+    n_countries = length(obs_list),
+    observed_total = observed_total,
+    pooled_null_mean = mean(pooled_null),
+    pooled_null_p2.5 = quantile(pooled_null, 0.025),
+    pooled_null_p97.5 = quantile(pooled_null, 0.975),
+    global_CR = observed_total / mean(pooled_null),
+    global_p = perm_pvalue(pooled_null, observed_total),
+    n_significant_FDR = sum(country_rows$p_FDR < 0.05)
+  )
+
+  list(summary = crop_summary, country = country_rows, pooled_null = pooled_null)
+}
+
+run_all_crops <- function(min_years, raw_data_list, B_pooled) {
+  all_summary <- data.frame()
+  all_country <- data.frame()
+  pooled_null_store <- list()
+
+  for (crop in crops) {
+    df <- filter_crop_data(raw_data_list[[crop]], min_years, YEAR_START, YEAR_END)
+    res <- run_crop(df, crop, B_pooled)
+    all_summary <- rbind(all_summary, res$summary)
+    all_country <- rbind(all_country, res$country)
+    pooled_null_store[[crop]] <- res$pooled_null
+  }
+
+  list(summary = all_summary, country = all_country, pooled_null = pooled_null_store)
+}
+
+run_crop_block_shift <- function(df, crop, B_pooled, block_length, n_reps) {
+  obs_list <- numeric(0)
+  null_list <- list()
+
+  for (ctry in unique(df$Country_ISO)) {
+    sub <- df[df$Country_ISO == ctry, ]
+    yield_raw <- sub$yield_hg_per_ha
+    temp_raw <- sub$TMX_ann
+    n_years <- length(yield_raw)
+    if (n_years < 10) next
+    t_index <- seq_along(yield_raw)
+
+    yield_detrend <- residuals(lm(yield_raw ~ t_index))
+
+    rec_temp <- count_records(temp_raw, "upper")
+    rec_yield_detrend <- count_records(yield_detrend, "lower")
+    rec_temp_conc <- rec_temp; rec_temp_conc[1] <- 0L
+    rec_yield_detrend_conc <- rec_yield_detrend; rec_yield_detrend_conc[1] <- 0L
+    obs_detrend <- sum(rec_temp_conc * rec_yield_detrend_conc)
+
+    nulldist <- block_shift_null(temp_raw, yield_detrend, block_length, n_reps)
+
+    obs_list <- c(obs_list, obs_detrend)
+    null_list[[ctry]] <- nulldist
+  }
+
+  observed_total <- sum(obs_list)
+  pooled_null <- numeric(B_pooled)
+  for (b in seq_len(B_pooled)) {
+    total_b <- 0
+    for (ctry in names(null_list)) total_b <- total_b + sample(null_list[[ctry]], 1)
+    pooled_null[b] <- total_b
+  }
+
+  data.frame(
+    crop = crop,
+    observed_total = observed_total,
+    pooled_null_mean = mean(pooled_null),
+    global_CR = observed_total / mean(pooled_null),
+    global_p = perm_pvalue(pooled_null, observed_total)
+  )
+}
+
+run_block_shift_robustness <- function(raw_data_list, B_pooled, block_length = 8, n_reps = 63) {
+  block_summary <- data.frame()
+  for (crop in crops) {
+    df <- filter_crop_data(raw_data_list[[crop]], 64, YEAR_START, YEAR_END)
+    block_summary <- rbind(block_summary, run_crop_block_shift(df, crop, B_pooled, block_length, n_reps))
+  }
+  block_summary
+}
+
+save_pdf <- function(plot_obj, filename, width = 8, height = 6) {
+  ggsave(filename, plot = plot_obj, device = cairo_pdf,
+         width = width, height = height, units = "in", dpi = 1600)
+}
+
+save_png <- function(plot_obj, filename, width = 8, height = 6) {
+  ggsave(filename, plot = plot_obj, device = "png",
+         width = width, height = height, units = "in", dpi = 1600)
+}
+
+make_plots_for_dataset <- function(dataset_tag, crop_summary, country_detail, pooled_null_store) {
+  plot_dir_labeled <- file.path(base_dir, "record_montecarlo", "plots", dataset_tag, "labeled")
+  plot_dir_unlabeled <- file.path(base_dir, "record_montecarlo", "plots", dataset_tag, "unlabeled")
+  dir.create(plot_dir_labeled, showWarnings = FALSE, recursive = TRUE)
+  dir.create(plot_dir_unlabeled, showWarnings = FALSE, recursive = TRUE)
+
+  crop_summary$crop <- factor(crop_summary$crop, levels = names(crop_colors))
+  crop_summary$significant <- crop_summary$global_p < 0.05
+
+  p1_labeled <- ggplot(crop_summary, aes(x = crop, y = global_CR, fill = crop)) +
+    geom_col(color = "black", linewidth = 0.3) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray30") +
+    geom_text(aes(label = sprintf("p=%.3f", global_p)), vjust = -0.5, size = 3) +
+    scale_fill_manual(values = crop_colors) +
+    labs(
+      title = sprintf("Global concurrence ratio by crop (%s)", dataset_tag),
+      subtitle = "Pooled climate upper-record / yield lower-record concurrence vs circular-shift null",
+      x = "Crop", y = "Global CR (observed / null mean)", fill = "Crop"
+    ) +
+    theme_minimal(base_size = 12)
+
+  p1_unlabeled <- ggplot(crop_summary, aes(x = crop, y = global_CR, fill = crop)) +
+    geom_col(color = "black", linewidth = 0.3) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray30") +
+    geom_text(aes(label = sprintf("p=%.3f", global_p)), vjust = -0.5, size = 3) +
+    scale_fill_manual(values = crop_colors) +
+    labs(x = "Crop", y = "Global CR (observed / null mean)", fill = "Crop") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_blank(), plot.subtitle = element_blank())
+
+  save_pdf(p1_labeled, file.path(plot_dir_labeled, "global_CR_by_crop.pdf"))
+  save_pdf(p1_unlabeled, file.path(plot_dir_unlabeled, "global_CR_by_crop.pdf"))
+  save_png(p1_labeled, file.path(plot_dir_labeled, "global_CR_by_crop.png"))
+  save_png(p1_unlabeled, file.path(plot_dir_unlabeled, "global_CR_by_crop.png"))
+
+  country_detail$crop <- factor(country_detail$crop, levels = names(crop_colors))
+
+  p2_labeled <- ggplot(country_detail, aes(x = crop, y = CR, color = crop)) +
+    geom_jitter(width = 0.15, alpha = 0.5, size = 1.5) +
+    geom_boxplot(fill = NA, outlier.shape = NA, color = "black", linewidth = 0.4) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray30") +
+    scale_color_manual(values = crop_colors) +
+    labs(
+      title = sprintf("Country-level concurrence ratio distribution (%s)", dataset_tag),
+      subtitle = "Each point is one country's CR (climate upper-record vs yield lower-record concurrence)",
+      x = "Crop", y = "CR", color = "Crop"
+    ) +
+    theme_minimal(base_size = 12)
+
+  p2_unlabeled <- ggplot(country_detail, aes(x = crop, y = CR, color = crop)) +
+    geom_jitter(width = 0.15, alpha = 0.5, size = 1.5) +
+    geom_boxplot(fill = NA, outlier.shape = NA, color = "black", linewidth = 0.4) +
+    geom_hline(yintercept = 1, linetype = "dashed", color = "gray30") +
+    scale_color_manual(values = crop_colors) +
+    labs(x = "Crop", y = "CR", color = "Crop") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_blank(), plot.subtitle = element_blank())
+
+  save_pdf(p2_labeled, file.path(plot_dir_labeled, "country_CR_distribution.pdf"))
+  save_pdf(p2_unlabeled, file.path(plot_dir_unlabeled, "country_CR_distribution.pdf"))
+  save_png(p2_labeled, file.path(plot_dir_labeled, "country_CR_distribution.png"))
+  save_png(p2_unlabeled, file.path(plot_dir_unlabeled, "country_CR_distribution.png"))
+
+  null_df <- do.call(rbind, lapply(names(pooled_null_store), function(crop) {
+    data.frame(crop = crop, null_value = pooled_null_store[[crop]])
+  }))
+  null_df$crop <- factor(null_df$crop, levels = names(crop_colors))
+
+  obs_df <- crop_summary[, c("crop", "observed_total")]
+  obs_df$crop <- factor(obs_df$crop, levels = names(crop_colors))
+
+  p3_labeled <- ggplot(null_df, aes(x = null_value, fill = crop)) +
+    geom_histogram(binwidth = 1, boundary = 0.5, color = NA) +
+    geom_vline(data = obs_df, aes(xintercept = observed_total), color = "black", linetype = "dashed") +
+    scale_fill_manual(values = crop_colors) +
+    facet_wrap(~crop, scales = "free", ncol = 2) +
+    labs(
+      title = sprintf("Pooled null distribution vs observed total concurrence (%s)", dataset_tag),
+      subtitle = "Dashed line = observed total concurrence count",
+      x = "Pooled null concurrence count", y = "Frequency", fill = "Crop"
+    ) +
+    theme_minimal(base_size = 11)
+
+  p3_unlabeled <- ggplot(null_df, aes(x = null_value, fill = crop)) +
+    geom_histogram(binwidth = 1, boundary = 0.5, color = NA) +
+    geom_vline(data = obs_df, aes(xintercept = observed_total), color = "black", linetype = "dashed") +
+    scale_fill_manual(values = crop_colors) +
+    facet_wrap(~crop, scales = "free", ncol = 2) +
+    labs(x = "Pooled null concurrence count", y = "Frequency", fill = "Crop") +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_blank(), plot.subtitle = element_blank())
+
+  save_pdf(p3_labeled, file.path(plot_dir_labeled, "pooled_null_vs_observed.pdf"), width = 10, height = 10)
+  save_pdf(p3_unlabeled, file.path(plot_dir_unlabeled, "pooled_null_vs_observed.pdf"), width = 10, height = 10)
+  save_png(p3_labeled, file.path(plot_dir_labeled, "pooled_null_vs_observed.png"), width = 10, height = 10)
+  save_png(p3_unlabeled, file.path(plot_dir_unlabeled, "pooled_null_vs_observed.png"), width = 10, height = 10)
+}
+
+raw_data_list <- lapply(crops, read_raw_crop, base_dir = base_dir)
+names(raw_data_list) <- crops
+
+raw_country_counts <- sapply(crops, function(c) length(unique(raw_data_list[[c]]$Country_ISO)))
+
+result_full <- run_all_crops(min_years = 64, raw_data_list = raw_data_list, B_pooled = B_pooled)
+result_min10 <- run_all_crops(min_years = 10, raw_data_list = raw_data_list, B_pooled = B_pooled)
+
+write.csv(result_full$summary, file.path(out_dir, "crop_summary_full_sample.csv"), row.names = FALSE)
+write.csv(result_full$country, file.path(out_dir, "country_detail_full_sample.csv"), row.names = FALSE)
+saveRDS(result_full$pooled_null, file.path(out_dir, "pooled_null_full_sample.rds"))
+
+write.csv(result_min10$summary, file.path(out_dir, "crop_summary_min10.csv"), row.names = FALSE)
+write.csv(result_min10$country, file.path(out_dir, "country_detail_min10.csv"), row.names = FALSE)
+saveRDS(result_min10$pooled_null, file.path(out_dir, "pooled_null_min10.rds"))
+
+appendix_table <- data.frame(
+  crop = crops,
+  raw_countries_in_file = as.integer(raw_country_counts[crops]),
+  full_sample_countries = result_full$summary$n_countries,
+  min10_countries = result_min10$summary$n_countries,
+  full_sample_CR = round(result_full$summary$global_CR, 3),
+  full_sample_p = round(result_full$summary$global_p, 5),
+  min10_CR = round(result_min10$summary$global_CR, 3),
+  min10_p = round(result_min10$summary$global_p, 5),
+  min10_n_significant_FDR = result_min10$summary$n_significant_FDR
+)
+
+wb <- createWorkbook()
+addWorksheet(wb, "country_counts_robustness")
+writeData(wb, "country_counts_robustness", appendix_table)
+setColWidths(wb, "country_counts_robustness", cols = 1:ncol(appendix_table), widths = "auto")
+saveWorkbook(wb, file.path(out_dir, "country_counts_robustness_appendix.xlsx"), overwrite = TRUE)
+
+print(appendix_table, row.names = FALSE)
+
+block_shift_summary <- run_block_shift_robustness(raw_data_list, B_pooled, block_length = 8, n_reps = 63)
+
+null_method_comparison <- data.frame(
+  crop = crops,
+  circular_shift_CR = round(result_full$summary$global_CR, 3),
+  circular_shift_p = round(result_full$summary$global_p, 5),
+  block_shift_CR = round(block_shift_summary$global_CR, 3),
+  block_shift_p = round(block_shift_summary$global_p, 5)
+)
+
+wb2 <- createWorkbook()
+addWorksheet(wb2, "null_method_comparison")
+writeData(wb2, "null_method_comparison", null_method_comparison)
+setColWidths(wb2, "null_method_comparison", cols = 1:ncol(null_method_comparison), widths = "auto")
+saveWorkbook(wb2, file.path(out_dir, "null_method_comparison_appendix.xlsx"), overwrite = TRUE)
+
+print(null_method_comparison, row.names = FALSE)
+
+##################################################
+
+run_crop_synchronized_null <- function(df, crop) {
+  countries <- unique(df$Country_ISO)
+  temp_list <- list()
+  yield_rec_list <- list()
+  n_years_ref <- NULL
+  observed_total <- 0
+
+  for (ctry in countries) {
+    sub <- df[df$Country_ISO == ctry, ]
+    yield_raw <- sub$yield_hg_per_ha
+    temp_raw <- sub$TMX_ann
+    ny <- length(yield_raw)
+    if (ny < 10) next
+    if (is.null(n_years_ref)) n_years_ref <- ny
+    if (ny != n_years_ref) next
+
+    t_index <- seq_along(yield_raw)
+    yield_detrend <- residuals(lm(yield_raw ~ t_index))
+    rec_temp <- count_records(temp_raw, "upper"); rec_temp[1] <- 0L
+    rec_yield <- count_records(yield_detrend, "lower"); rec_yield[1] <- 0L
+
+    observed_total <- observed_total + sum(rec_temp * rec_yield)
+    temp_list[[ctry]] <- temp_raw
+    yield_rec_list[[ctry]] <- rec_yield
+  }
+
+  n <- n_years_ref
+  n_shift <- n - 1
+  sync_null <- numeric(n_shift)
+  for (i in seq_len(n_shift)) {
+    total_i <- 0
+    for (ctry in names(temp_list)) {
+      temp_shift <- temp_list[[ctry]][((seq_len(n) - 1 + i) %% n) + 1]
+      rec_temp_shift <- count_records(temp_shift, "upper")
+      rec_temp_shift[1] <- 0L
+      total_i <- total_i + sum(rec_temp_shift * yield_rec_list[[ctry]])
+    }
+    sync_null[i] <- total_i
+  }
+
+  data.frame(
+    crop = crop,
+    n_countries = length(temp_list),
+    observed_total = observed_total,
+    sync_null_mean = round(mean(sync_null), 2),
+    sync_CR = round(observed_total / mean(sync_null), 3),
+    sync_p = round(perm_pvalue(sync_null, observed_total), 5)
+  )
+}
+
+synchronized_results <- data.frame()
+for (crop in crops) {
+  df <- filter_crop_data(raw_data_list[[crop]], 64, YEAR_START, YEAR_END)
+  synchronized_results <- rbind(synchronized_results, run_crop_synchronized_null(df, crop))
+}
+
+independent_vs_synchronized <- data.frame(
+  crop = crops,
+  nullA_country_specific_CR = round(result_full$summary$global_CR, 3),
+  nullA_country_specific_p = round(result_full$summary$global_p, 5),
+  nullB_synchronized_CR_PRIMARY = synchronized_results$sync_CR,
+  nullB_synchronized_p_PRIMARY = synchronized_results$sync_p
+)
+
+wb7 <- createWorkbook()
+addWorksheet(wb7, "nullA_vs_nullB_primary")
+writeData(wb7, "nullA_vs_nullB_primary", independent_vs_synchronized)
+setColWidths(wb7, "nullA_vs_nullB_primary", cols = 1:ncol(independent_vs_synchronized), widths = "auto")
+saveWorkbook(wb7, file.path(out_dir, "synchronized_null_comparison_appendix.xlsx"), overwrite = TRUE)
+
+cat("\n=== Null A: country-specific shift (SENSITIVITY) vs Null B: synchronized shift (PRIMARY) ===\n")
+print(independent_vs_synchronized, row.names = FALSE)
+
+##################################################
+
+model_comparison <- aggregate(
+  cbind(concurrence_raw, concurrence_detrend) ~ crop,
+  data = result_full$country,
+  FUN = sum
+)
+model_comparison$difference <- model_comparison$concurrence_detrend - model_comparison$concurrence_raw
+model_comparison <- model_comparison[match(crops, model_comparison$crop), ]
+
+wb3 <- createWorkbook()
+addWorksheet(wb3, "model_A_vs_B_comparison")
+writeData(wb3, "model_A_vs_B_comparison", model_comparison)
+setColWidths(wb3, "model_A_vs_B_comparison", cols = 1:ncol(model_comparison), widths = "auto")
+saveWorkbook(wb3, file.path(out_dir, "model_A_vs_B_comparison_appendix.xlsx"), overwrite = TRUE)
+
+print(model_comparison, row.names = FALSE)
+
+##################################################
+
+library(maps)
+library(ISOcodes)
+
+data("ISO_3166_1")
+
+iso3_name_overrides <- c(
+  BOL = "Bolivia",
+  BRN = "Brunei",
+  COD = "Democratic Republic of the Congo",
+  COG = "Republic of Congo",
+  CZE = "Czech Republic",
+  GBR = "UK",
+  IRN = "Iran",
+  KOR = "South Korea",
+  PRK = "North Korea",
+  LAO = "Laos",
+  MDA = "Moldova",
+  MMR = "Myanmar",
+  RUS = "Russia",
+  SYR = "Syria",
+  TUR = "Turkey",
+  TZA = "Tanzania",
+  USA = "USA",
+  VEN = "Venezuela",
+  VNM = "Vietnam",
+  CIV = "Ivory Coast",
+  TTO = "Trinidad"
+)
+
+iso3_to_map_name <- function(iso3_codes) {
+  base_name <- ISO_3166_1$Name[match(iso3_codes, ISO_3166_1$Alpha_3)]
+  override <- iso3_name_overrides[iso3_codes]
+  ifelse(!is.na(override), override, base_name)
+}
+
+make_hatch_lines <- function(poly_df, spacing = 0.6) {
+  bbox <- c(min(poly_df$long), max(poly_df$long), min(poly_df$lat), max(poly_df$lat))
+  off_min <- bbox[1] - bbox[4]
+  off_max <- bbox[2] - bbox[3]
+  offsets <- seq(off_min, off_max, by = spacing)
+  segs <- data.frame()
+  for (off in offsets) {
+    xs <- seq(bbox[1], bbox[2], length.out = 100)
+    ys <- xs - off
+    inside <- rep(FALSE, length(xs))
+    for (g in unique(poly_df$group)) {
+      sub <- poly_df[poly_df$group == g, ]
+      if (nrow(sub) < 3) next
+      inside <- inside | as.logical(sp::point.in.polygon(xs, ys, sub$long, sub$lat))
+    }
+    if (!any(inside)) next
+    rl <- rle(inside)
+    idx_end <- cumsum(rl$lengths); idx_start <- idx_end - rl$lengths + 1
+    for (k in seq_along(rl$lengths)) {
+      if (rl$values[k]) {
+        i1 <- idx_start[k]; i2 <- idx_end[k]
+        segs <- rbind(segs, data.frame(x = xs[i1], xend = xs[i2], y = ys[i1], yend = ys[i2]))
+      }
+    }
+  }
+  segs
+}
+
+make_spatial_map <- function(crop_name, dataset_tag, country_detail) {
+  crop_data <- country_detail[country_detail$crop == crop_name, ]
+  crop_data$map_name <- iso3_to_map_name(crop_data$country)
+
+  # CR=NA (null_mean=0, full-sample'da var ama oran tanimsiz) olan ulkeler --
+  # bunlar cizim uzerinde capraz cizgiyle (hatching) "veri yok" gri renginden ayirt edilir
+  undefined_names <- crop_data$map_name[is.na(crop_data$CR)]
+
+  world_map <- map_data("world")
+  world_map <- world_map[world_map$region != "Antarctica", ]
+
+  merged <- merge(world_map, crop_data[, c("map_name", "CR", "p_value")],
+                   by.x = "region", by.y = "map_name", all.x = TRUE)
+  merged <- merged[order(merged$group, merged$order), ]
+
+  plot_dir_labeled <- file.path(base_dir, "record_montecarlo", "plots", dataset_tag, "labeled")
+  plot_dir_unlabeled <- file.path(base_dir, "record_montecarlo", "plots", dataset_tag, "unlabeled")
+  dir.create(plot_dir_labeled, showWarnings = FALSE, recursive = TRUE)
+  dir.create(plot_dir_unlabeled, showWarnings = FALSE, recursive = TRUE)
+
+  add_hatching <- function(p) {
+    for (nm in undefined_names) {
+      poly <- world_map[world_map$region == nm, ]
+      if (nrow(poly) == 0) next
+      hatch <- make_hatch_lines(poly, spacing = 0.6)
+      if (nrow(hatch) > 0) {
+        p <- p + geom_segment(data = hatch, aes(x = x, xend = xend, y = y, yend = yend),
+                               color = "gray40", linewidth = 0.25, inherit.aes = FALSE)
+      }
+    }
+    p
+  }
+
+  p_labeled <- ggplot(merged, aes(x = long, y = lat, group = group, fill = CR)) +
+    geom_polygon(color = "gray60", linewidth = 0.1) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                          midpoint = 1, na.value = "gray90")
+  p_labeled <- add_hatching(p_labeled) +
+    coord_fixed(1.3) +
+    labs(
+      title = sprintf("Country-level concurrence ratio map: %s (%s)", crop_name, dataset_tag),
+      subtitle = "Red = CR above 1, blue = CR below 1, plain gray = not in sample, hatched gray = CR undefined (null mean = 0)",
+      fill = "CR"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(axis.title = element_blank(), axis.text = element_blank(), panel.grid = element_blank())
+
+  p_unlabeled <- ggplot(merged, aes(x = long, y = lat, group = group, fill = CR)) +
+    geom_polygon(color = "gray60", linewidth = 0.1) +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                          midpoint = 1, na.value = "gray90")
+  p_unlabeled <- add_hatching(p_unlabeled) +
+    coord_fixed(1.3) +
+    labs(fill = "CR") +
+    theme_minimal(base_size = 12) +
+    theme(axis.title = element_blank(), axis.text = element_blank(), panel.grid = element_blank())
+
+  fname <- sprintf("spatial_map_%s.pdf", crop_name)
+  fname_png <- sprintf("spatial_map_%s.png", crop_name)
+  save_pdf(p_labeled, file.path(plot_dir_labeled, fname), width = 10, height = 6)
+  save_pdf(p_unlabeled, file.path(plot_dir_unlabeled, fname), width = 10, height = 6)
+  save_png(p_labeled, file.path(plot_dir_labeled, fname_png), width = 10, height = 6)
+  save_png(p_unlabeled, file.path(plot_dir_unlabeled, fname_png), width = 10, height = 6)
+}
+
+for (crop_name in crops) {
+  make_spatial_map(crop_name, "full_sample", result_full$country)
+}
+
+make_plots_for_dataset("full_sample", result_full$summary, result_full$country, result_full$pooled_null)
+make_plots_for_dataset("min10", result_min10$summary, result_min10$country, result_min10$pooled_null)
+
+##################################################
+
+world_map_check <- map_data("world")
+world_regions_check <- unique(world_map_check$region)
+
+build_map_qc_table <- function(country_detail, dataset_tag) {
+  qc <- data.frame(
+    dataset = dataset_tag,
+    crop = country_detail$crop,
+    country_iso3 = country_detail$country,
+    map_name = iso3_to_map_name(country_detail$country)
+  )
+  qc$matched_on_map <- qc$map_name %in% world_regions_check
+  qc
+}
+
+map_qc_full <- build_map_qc_table(result_full$country, "full_sample")
+map_qc_min10 <- build_map_qc_table(result_min10$country, "min10")
+map_qc_all <- rbind(map_qc_full, map_qc_min10)
+
+map_qc_unmatched <- map_qc_all[!map_qc_all$matched_on_map, ]
+
+map_qc_summary <- aggregate(
+  matched_on_map ~ dataset + crop,
+  data = map_qc_all,
+  FUN = function(x) sum(!x)
+)
+names(map_qc_summary)[names(map_qc_summary) == "matched_on_map"] <- "n_unmatched"
+
+wb4 <- createWorkbook()
+addWorksheet(wb4, "all_countries")
+writeData(wb4, "all_countries", map_qc_all)
+setColWidths(wb4, "all_countries", cols = 1:ncol(map_qc_all), widths = "auto")
+
+addWorksheet(wb4, "unmatched_only")
+writeData(wb4, "unmatched_only", map_qc_unmatched)
+setColWidths(wb4, "unmatched_only", cols = 1:ncol(map_qc_unmatched), widths = "auto")
+
+addWorksheet(wb4, "summary_by_crop")
+writeData(wb4, "summary_by_crop", map_qc_summary)
+setColWidths(wb4, "summary_by_crop", cols = 1:ncol(map_qc_summary), widths = "auto")
+
+saveWorkbook(wb4, file.path(out_dir, "map_matching_qc_appendix.xlsx"), overwrite = TRUE)
+
+cat(sprintf("\nHarita eslesme kontrolu: toplam %d satirdan %d tanesi eslesmedi.\n",
+            nrow(map_qc_all), nrow(map_qc_unmatched)))
+print(map_qc_summary[map_qc_summary$n_unmatched > 0, ], row.names = FALSE)
+
+##################################################
+
+verify_actual_draw_counts <- function(country_detail, dataset_tag, world_map) {
+  mismatches <- data.frame()
+  for (crop in unique(country_detail$crop)) {
+    cd <- country_detail[country_detail$crop == crop, ]
+    n_undefined_CR <- sum(!is.finite(cd$CR))
+    cd <- cd[is.finite(cd$CR), ]
+    cd$map_name <- iso3_to_map_name(cd$country)
+    n_expected <- length(unique(cd$country))
+
+    merged <- merge(world_map, cd[, c("map_name", "CR", "p_value")],
+                     by.x = "region", by.y = "map_name", all.x = TRUE)
+    drawn_regions <- unique(merged$region[!is.na(merged$CR)])
+    n_drawn <- length(intersect(unique(cd$map_name), drawn_regions))
+
+    if (n_drawn != n_expected) {
+      mismatches <- rbind(mismatches, data.frame(
+        dataset = dataset_tag, crop = crop,
+        n_expected = n_expected, n_actually_drawn = n_drawn,
+        n_undefined_CR_excluded = n_undefined_CR
+      ))
+    }
+  }
+  mismatches
+}
+
+world_map_for_draw_check <- map_data("world")
+world_map_for_draw_check <- world_map_for_draw_check[world_map_for_draw_check$region != "Antarctica", ]
+
+draw_mismatches <- rbind(
+  verify_actual_draw_counts(result_full$country, "full_sample", world_map_for_draw_check),
+  verify_actual_draw_counts(result_min10$country, "min10", world_map_for_draw_check)
+)
+
+if (nrow(draw_mismatches) == 0) {
+  cat("\nCizim dogrulamasi: TUM tanimli-CR ulkeler her urun/esik icin haritada dogru cizildi (gercek uyumsuzluk yok).\n")
+} else {
+  cat("\nCizim dogrulamasi: asagidaki farklar TAMAMEN tanimsiz CR (null_mean=0) disarida birakilmasindan kaynaklaniyorsa BEKLENEN durumdur, gercek hata degildir:\n")
+  print(draw_mismatches, row.names = FALSE)
+}
+
+##################################################
+
+get_country_centroids <- function(map_names, world_map) {
+  centroids <- data.frame()
+  for (nm in unique(map_names)) {
+    sub <- world_map[world_map$region == nm, ]
+    centroids <- rbind(centroids, data.frame(
+      map_name = nm,
+      centroid_long = mean(sub$long),
+      centroid_lat = mean(sub$lat)
+    ))
+  }
+  centroids
+}
+
+haversine_dist <- function(lon1, lat1, lon2, lat2) {
+  R <- 6371
+  to_rad <- pi / 180
+  dlon <- (lon2 - lon1) * to_rad
+  dlat <- (lat2 - lat1) * to_rad
+  a <- sin(dlat / 2)^2 + cos(lat1 * to_rad) * cos(lat2 * to_rad) * sin(dlon / 2)^2
+  2 * R * asin(pmin(1, sqrt(a)))
+}
+
+build_knn_weights <- function(centroids, k) {
+  n <- nrow(centroids)
+  W <- matrix(0, n, n)
+  for (i in seq_len(n)) {
+    d <- haversine_dist(centroids$centroid_long[i], centroids$centroid_lat[i],
+                         centroids$centroid_long, centroids$centroid_lat)
+    d[i] <- Inf
+    nearest <- order(d)[seq_len(min(k, n - 1))]
+    W[i, nearest] <- 1
+  }
+  W
+}
+
+morans_i_stat <- function(x, W) {
+  n <- length(x)
+  x_dev <- x - mean(x)
+  num <- sum(W * outer(x_dev, x_dev))
+  denom <- sum(x_dev^2)
+  (n / sum(W)) * (num / denom)
+}
+
+morans_i_permutation_test <- function(x, W, n_perm = 10000) {
+  observed <- morans_i_stat(x, W)
+  perm_values <- numeric(n_perm)
+  for (p in seq_len(n_perm)) {
+    x_perm <- sample(x)
+    perm_values[p] <- morans_i_stat(x_perm, W)
+  }
+  p_value <- perm_pvalue(perm_values, observed)
+  list(observed = observed, p_value = p_value,
+       perm_mean = mean(perm_values), perm_sd = sd(perm_values))
+}
+
+world_map_for_centroids <- map_data("world")
+world_map_for_centroids <- world_map_for_centroids[world_map_for_centroids$region != "Antarctica", ]
+
+morans_i_results <- data.frame()
+
+for (crop_name in crops) {
+  cd <- result_full$country[result_full$country$crop == crop_name, ]
+  cd <- cd[is.finite(cd$CR), ]
+  n_excluded <- sum(result_full$country$crop == crop_name) - nrow(cd)
+  cd$map_name <- iso3_to_map_name(cd$country)
+
+  centroids <- get_country_centroids(cd$map_name, world_map_for_centroids)
+  cd <- merge(cd, centroids, by = "map_name")
+  cd <- cd[order(cd$country), ]
+
+  W <- build_knn_weights(cd, k = 5)
+  test_result <- morans_i_permutation_test(cd$CR, W, n_perm = 10000)
+
+  morans_i_results <- rbind(morans_i_results, data.frame(
+    crop = crop_name,
+    n_countries = nrow(cd),
+    n_excluded_undefined_CR = n_excluded,
+    morans_I = round(test_result$observed, 4),
+    permutation_null_mean = round(test_result$perm_mean, 4),
+    permutation_null_sd = round(test_result$perm_sd, 4),
+    p_value = round(test_result$p_value, 5)
+  ))
+}
+
+wb5 <- createWorkbook()
+addWorksheet(wb5, "morans_I_spatial_clustering")
+writeData(wb5, "morans_I_spatial_clustering", morans_i_results)
+setColWidths(wb5, "morans_I_spatial_clustering", cols = 1:ncol(morans_i_results), widths = "auto")
+saveWorkbook(wb5, file.path(out_dir, "morans_i_appendix.xlsx"), overwrite = TRUE)
+
+print(morans_i_results, row.names = FALSE)
+
+##################################################
+
+MC_REPLICATIONS <- 10000
+MC_SERIES_LENGTH <- 64
+MC_RHO_VALUES <- c(0.2, 0.5, 0.8)
+
+classical_Hn <- sum(1 / (1:MC_SERIES_LENGTH))
+
+sim_iid <- function(n) rnorm(n)
+
+sim_ar1 <- function(n, rho) {
+  x <- numeric(n)
+  x[1] <- rnorm(1)
+  for (t in 2:n) x[t] <- rho * x[t - 1] + rnorm(1) * sqrt(1 - rho^2)
+  x
+}
+
+sim_trend <- function(n, slope = 0.03) slope * (1:n) + rnorm(n)
+
+sim_trend_ar1 <- function(n, rho, slope = 0.03) slope * (1:n) + sim_ar1(n, rho)
+
+sim_heterosk <- function(n) {
+  sigma_t <- seq(0.5, 2, length.out = n)
+  rnorm(n, sd = sigma_t)
+}
+
+sim_trend_ar1_hetero <- function(n, rho, slope = 0.03) {
+  sigma_t <- seq(0.5, 1.5, length.out = n)
+  slope * (1:n) + sim_ar1(n, rho) * sigma_t
+}
+
+run_mc_scenario <- function(generator, n_rep, series_length) {
+  counts <- integer(n_rep)
+  for (r in seq_len(n_rep)) counts[r] <- sum(count_records(generator(series_length), "upper"))
+  counts
+}
+
+mc_scenarios <- list(
+  "A_IID"             = function(n) sim_iid(n),
+  "B_AR1_rho0.2"       = function(n) sim_ar1(n, 0.2),
+  "C_AR1_rho0.5"       = function(n) sim_ar1(n, 0.5),
+  "D_AR1_rho0.8"       = function(n) sim_ar1(n, 0.8),
+  "E_Trend"            = function(n) sim_trend(n),
+  "F_Trend_AR1_rho0.5" = function(n) sim_trend_ar1(n, 0.5),
+  "G_Heteroskedastic"  = function(n) sim_heterosk(n),
+  "H_Climate_like"     = function(n) sim_trend_ar1_hetero(n, 0.5)
+)
+
+mc_results <- data.frame()
+
+for (scenario_name in names(mc_scenarios)) {
+  counts <- run_mc_scenario(mc_scenarios[[scenario_name]], MC_REPLICATIONS, MC_SERIES_LENGTH)
+  mc_results <- rbind(mc_results, data.frame(
+    scenario = scenario_name,
+    mean_record_count = round(mean(counts), 3),
+    classical_Hn = round(classical_Hn, 3),
+    deviation_pct = round(100 * (mean(counts) - classical_Hn) / classical_Hn, 2),
+    p2.5 = quantile(counts, 0.025),
+    p97.5 = quantile(counts, 0.975)
+  ))
+}
+
+wb6 <- createWorkbook()
+addWorksheet(wb6, "monte_carlo_validation")
+writeData(wb6, "monte_carlo_validation", mc_results)
+setColWidths(wb6, "monte_carlo_validation", cols = 1:ncol(mc_results), widths = "auto")
+saveWorkbook(wb6, file.path(out_dir, "monte_carlo_validation_appendix.xlsx"), overwrite = TRUE)
+
+print(mc_results, row.names = FALSE)
+
+##################################################
+# Figure 1: Monte Carlo validation bar chart
+##################################################
+
+mc_label_map <- c(
+  "A_IID"               = "Independent\n(baseline)",
+  "B_AR1_rho0.2"        = "AR(1)\n\u03c1 = 0.2",
+  "C_AR1_rho0.5"        = "AR(1)\n\u03c1 = 0.5",
+  "D_AR1_rho0.8"        = "AR(1)\n\u03c1 = 0.8",
+  "E_Trend"             = "Trend",
+  "F_Trend_AR1_rho0.5"  = "Trend +\nAR(1)",
+  "G_Heteroskedastic"   = "Hetero-\nskedastic",
+  "H_Climate_like"      = "Trend + AR(1)\n+ heterosk."
+)
+mc_results$label <- factor(mc_label_map[mc_results$scenario], levels = mc_label_map)
+
+p_fig1 <- ggplot(mc_results, aes(x = label, y = deviation_pct)) +
+  geom_col(fill = "#4B8BBE", width = 0.65) +
+  geom_text(aes(label = sprintf("%.1f%%", deviation_pct)), vjust = -0.5, size = 3.3) +
+  labs(
+    title = "Deviation from classical record-count benchmark across Monte Carlo scenarios",
+    x = NULL,
+    y = "Deviation from classical benchmark (%)"
+  ) +
+  scale_y_continuous(limits = c(min(0, min(mc_results$deviation_pct) - 5), max(mc_results$deviation_pct) * 1.12), expand = c(0, 0)) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(size = 9, lineheight = 0.9),
+    plot.title = element_text(size = 11, face = "plain")
+  )
+
+mc_plot_dir <- file.path(base_dir, "record_montecarlo", "plots")
+dir.create(mc_plot_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(file.path(mc_plot_dir, "figure1_mc_validation_labeled.png"), p_fig1, width = 8, height = 5, dpi = 200)
+ggsave(file.path(mc_plot_dir, "figure1_mc_validation_labeled.pdf"), p_fig1, width = 8, height = 5)
+cat("\nFigure 1 (Monte Carlo dogrulama grafigi) kaydedildi:", file.path(mc_plot_dir, "figure1_mc_validation_labeled.png"), "\n")
+
+
+##################################################
+
+crop_level_fdr <- data.frame(
+  crop = crops,
+  nullA_CR = independent_vs_synchronized$nullA_country_specific_CR,
+  nullA_p_raw = independent_vs_synchronized$nullA_country_specific_p,
+  nullB_CR = independent_vs_synchronized$nullB_synchronized_CR_PRIMARY,
+  nullB_p_raw = independent_vs_synchronized$nullB_synchronized_p_PRIMARY
+)
+crop_level_fdr$nullA_p_FDR <- p.adjust(crop_level_fdr$nullA_p_raw, method = "BH")
+crop_level_fdr$nullB_p_FDR <- p.adjust(crop_level_fdr$nullB_p_raw, method = "BH")
+crop_level_fdr$nullA_significant_FDR <- crop_level_fdr$nullA_p_FDR < 0.05
+crop_level_fdr$nullB_significant_FDR <- crop_level_fdr$nullB_p_FDR < 0.05
+
+wb8 <- createWorkbook()
+addWorksheet(wb8, "crop_level_BH_FDR")
+writeData(wb8, "crop_level_BH_FDR", crop_level_fdr)
+setColWidths(wb8, "crop_level_BH_FDR", cols = 1:ncol(crop_level_fdr), widths = "auto")
+saveWorkbook(wb8, file.path(out_dir, "crop_level_BH_FDR_appendix.xlsx"), overwrite = TRUE)
+
+cat("\n=== 8 URUN ARASI BH-FDR DUZELTMESI (hem Null A hem Null B icin) ===\n")
+print(crop_level_fdr, row.names = FALSE)
+
+##################################################
+
+detrend_yield <- function(yield_raw, method = c("linear", "quadratic", "loess")) {
+  method <- match.arg(method)
+  t_index <- seq_along(yield_raw)
+  if (method == "linear") {
+    residuals(lm(yield_raw ~ t_index))
+  } else if (method == "quadratic") {
+    residuals(lm(yield_raw ~ t_index + I(t_index^2)))
+  } else {
+    fit <- loess(yield_raw ~ t_index, span = 0.75)
+    yield_raw - predict(fit)
+  }
+}
+
+run_crop_detrend_variant <- function(df, crop, B_pooled, detrend_method) {
+  obs_list <- numeric(0)
+  null_list <- list()
+
+  for (ctry in unique(df$Country_ISO)) {
+    sub <- df[df$Country_ISO == ctry, ]
+    yield_raw <- sub$yield_hg_per_ha
+    temp_raw <- sub$TMX_ann
+    n_years <- length(yield_raw)
+    if (n_years < 10) next
+
+    yield_detrend <- detrend_yield(yield_raw, detrend_method)
+
+    rec_temp <- count_records(temp_raw, "upper")
+    rec_yield_detrend <- count_records(yield_detrend, "lower")
+    rec_temp_conc <- rec_temp; rec_temp_conc[1] <- 0L
+    rec_yield_conc <- rec_yield_detrend; rec_yield_conc[1] <- 0L
+    obs_detrend <- sum(rec_temp_conc * rec_yield_conc)
+
+    nulldist <- circular_shift_null(temp_raw, yield_detrend, n_shift = n_years - 1)
+
+    obs_list <- c(obs_list, obs_detrend)
+    null_list[[ctry]] <- nulldist
+  }
+
+  observed_total <- sum(obs_list)
+  pooled_null <- numeric(B_pooled)
+  for (b in seq_len(B_pooled)) {
+    total_b <- 0
+    for (ctry in names(null_list)) total_b <- total_b + sample(null_list[[ctry]], 1)
+    pooled_null[b] <- total_b
+  }
+
+  data.frame(
+    crop = crop, detrend_method = detrend_method,
+    observed_total = observed_total,
+    pooled_null_mean = mean(pooled_null),
+    CR = observed_total / mean(pooled_null),
+    p_value = perm_pvalue(pooled_null, observed_total)
+  )
+}
+
+run_crop_synchronized_detrend_variant <- function(df, crop, detrend_method) {
+  countries <- unique(df$Country_ISO)
+  temp_list <- list()
+  yield_rec_list <- list()
+  n_years_ref <- NULL
+  observed_total <- 0
+
+  for (ctry in countries) {
+    sub <- df[df$Country_ISO == ctry, ]
+    yield_raw <- sub$yield_hg_per_ha
+    temp_raw <- sub$TMX_ann
+    ny <- length(yield_raw)
+    if (ny < 10) next
+    if (is.null(n_years_ref)) n_years_ref <- ny
+    if (ny != n_years_ref) next
+
+    yield_detrend <- detrend_yield(yield_raw, detrend_method)
+    rec_temp <- count_records(temp_raw, "upper"); rec_temp[1] <- 0L
+    rec_yield <- count_records(yield_detrend, "lower"); rec_yield[1] <- 0L
+
+    observed_total <- observed_total + sum(rec_temp * rec_yield)
+    temp_list[[ctry]] <- temp_raw
+    yield_rec_list[[ctry]] <- rec_yield
+  }
+
+  n <- n_years_ref
+  n_shift <- n - 1
+  sync_null <- numeric(n_shift)
+  for (i in seq_len(n_shift)) {
+    total_i <- 0
+    for (ctry in names(temp_list)) {
+      temp_shift <- temp_list[[ctry]][((seq_len(n) - 1 + i) %% n) + 1]
+      rec_temp_shift <- count_records(temp_shift, "upper")
+      rec_temp_shift[1] <- 0L
+      total_i <- total_i + sum(rec_temp_shift * yield_rec_list[[ctry]])
+    }
+    sync_null[i] <- total_i
+  }
+
+  data.frame(
+    crop = crop, detrend_method = detrend_method,
+    observed_total = observed_total,
+    sync_null_mean = mean(sync_null),
+    sync_CR = observed_total / mean(sync_null),
+    sync_p = perm_pvalue(sync_null, observed_total)
+  )
+}
+
+detrend_methods <- c("linear", "quadratic", "loess")
+detrend_robustness_A <- data.frame()
+detrend_robustness_B <- data.frame()
+
+for (crop in crops) {
+  df <- filter_crop_data(raw_data_list[[crop]], 64, YEAR_START, YEAR_END)
+  for (dm in detrend_methods) {
+    if (dm == "linear") {
+      # Linear detrend IS Model B / the primary specification already computed above
+      # (result_full$summary, synchronized_results) -- reuse those exact numbers
+      # instead of re-running an independent Monte Carlo draw, so this table is
+      # guaranteed to agree with Table 2 / the main results rather than differing
+      # by Monte Carlo noise between two separately-sampled runs of the same quantity.
+      rowA <- result_full$summary[result_full$summary$crop == crop, ]
+      resA <- data.frame(crop = crop, detrend_method = "linear",
+                          observed_total = rowA$observed_total,
+                          pooled_null_mean = rowA$pooled_null_mean,
+                          CR = rowA$global_CR, p_value = rowA$global_p)
+      rowB <- synchronized_results[synchronized_results$crop == crop, ]
+      resB <- data.frame(crop = crop, detrend_method = "linear",
+                          sync_CR = rowB$sync_CR, sync_p = rowB$sync_p)
+    } else {
+      resA <- run_crop_detrend_variant(df, crop, B_pooled, dm)
+      resB <- run_crop_synchronized_detrend_variant(df, crop, dm)
+    }
+    detrend_robustness_A <- rbind(detrend_robustness_A, resA)
+    detrend_robustness_B <- rbind(detrend_robustness_B, data.frame(
+      crop = resB$crop, detrend_method = resB$detrend_method,
+      observed_total = if (dm == "linear") rowB$observed_total else resB$observed_total,
+      pooled_null_mean = if (dm == "linear") rowB$sync_null_mean else resB$sync_null_mean,
+      CR = resB$sync_CR, p_value = resB$sync_p
+    ))
+  }
+}
+
+detrend_robustness_A$null_type <- "NullA_country_specific"
+detrend_robustness_B$null_type <- "NullB_synchronized_PRIMARY"
+detrend_robustness_all <- rbind(detrend_robustness_A, detrend_robustness_B)
+detrend_robustness_all$CR <- round(detrend_robustness_all$CR, 3)
+detrend_robustness_all$p_value <- round(detrend_robustness_all$p_value, 5)
+
+wb9 <- createWorkbook()
+addWorksheet(wb9, "detrend_method_robustness")
+writeData(wb9, "detrend_method_robustness", detrend_robustness_all)
+setColWidths(wb9, "detrend_method_robustness", cols = 1:ncol(detrend_robustness_all), widths = "auto")
+saveWorkbook(wb9, file.path(out_dir, "detrend_method_robustness_appendix.xlsx"), overwrite = TRUE)
+
+cat("\n=== DETREND YONTEMI ROBUSTNESS (linear / quadratic / loess), Null A ve Null B ===\n")
+print(detrend_robustness_all[order(detrend_robustness_all$null_type, detrend_robustness_all$crop, detrend_robustness_all$detrend_method), ], row.names = FALSE)
+
+##################################################
+# TYPE-I HATA (SIZE) SIMULASYONU
+#
+# Amac: Null A ve Null B'nin GERCEKTEN nominal %5 seviyesinde
+# Tip-I hata kontrolu saglayip saglamadigini test etmek.
+#
+# Yontem: "Dunya" simule ediyoruz - sicaklik ve verim serileri
+# arasinda HICBIR gercek concurrence iliskisi YOK (H0 dogru),
+# ama gercekci bir bagimlilik yapisi VAR:
+#   - Sicaklikta: ulkeye ozel trend + ortak (cross-country) sok
+#     faktoru (farkli ulkelerde farkli agirlikla) + AR(1)
+#   - Verimde: bagimsiz trend + kendi AR(1)'i + artan varyans
+#     (heteroskedastisite) - sicaklikla veya ortak faktorle HICBIR
+#     baglantisi yok
+# Sonra ayni gercek analiz koduyla (count_records, circular_shift_null,
+# perm_pvalue - yukarida zaten tanimli) Null A ve Null B pooled
+# testlerini calistirip p-degerini kaydediyoruz. Bunu SIM_N_REPS kez
+# tekrarlayip p<0.05 oranina bakiyoruz - eger null dogru kalibre
+# ediyorsa bu oran ~0.05 civarinda olmali.
+#
+# ÖNEMLI: Bu bolum hesaplama acisindan agir olabilir. Asagidaki
+# parametreleri (ozellikle SIM_N_REPS ve SIM_B_POOLED) makinenizin
+# gucune gore ayarlayin. Kaba tahmin: SIM_N_REPS=500, SIM_B_POOLED=2000,
+# SIM_N_COUNTRIES=60 ile calisma suresi muhtemelen 30-90 dakika
+# arasinda olabilir (Null A'nin pooled Monte Carlo adimi en pahali
+# kisim). Once kucuk bir deneme (SIM_N_REPS=20) ile calisma suresini
+# olcup sonra tam calistirmanizi oneririm.
+##################################################
+
+SIM_N_COUNTRIES <- 60        # simule edilen ulke sayisi (gercek veriyle kiyaslanabilir buyuklukte)
+SIM_T <- 64                  # seri uzunlugu (full-sample ile ayni)
+SIM_N_REPS <- 500            # kac "dunya" simule edilecek (arttirmak hassasiyeti arttirir, suredeyi de arttirir)
+SIM_B_POOLED <- 2000         # Null A'nin pooled Monte Carlo cekim sayisi (10000 yerine 2000 - hiz icin; isterseniz arttirin)
+
+# --- DGP (veri-uretme-sureci) parametreleri - gercekci degerler, degistirebilirsiniz ---
+common_factor_sd      <- 1.0   # ulkeler-arasi ortak sicaklik soku gucu (Null B'nin tam olarak test ettigi yapi)
+country_ar1_rho_temp  <- 0.4   # sicaklikta ulkeye-ozel AR(1) katsayisi
+country_ar1_rho_yield <- 0.3   # verimde ulkeye-ozel AR(1) katsayisi
+temp_trend_slope_mean <- 0.02  # ortalama yillik isinma egilimi (ulkeler arasi degisken)
+temp_trend_slope_sd   <- 0.01
+yield_trend_slope_mean<- 1.0   # ortalama yillik verim artis egilimi (keyfi birim)
+yield_trend_slope_sd  <- 0.3
+heterosked_slope      <- 0.02  # verim gurultusunde zamanla artan varyans
+
+simulate_one_world <- function(n_countries = SIM_N_COUNTRIES, Tn = SIM_T) {
+  # Ortak faktor: rastgele-yuruyus benzeri, tum ulkeleri farkli agirliklarla etkileyen paylasilan bir sok
+  # (kuresel isinma sinyali veya bolgesel iklim anomalisi icin stilize bir vekil)
+  common_factor <- cumsum(rnorm(Tn, sd = common_factor_sd / sqrt(Tn)))
+
+  temp_list <- list()
+  yield_list <- list()
+
+  for (i in seq_len(n_countries)) {
+    # --- Sicaklik: trend + ortak faktore maruziyet + ulkeye-ozel AR(1) + gurultu ---
+    trend_i <- rnorm(1, temp_trend_slope_mean, temp_trend_slope_sd)
+    loading_i <- runif(1, 0.5, 1.5)
+    ar1 <- numeric(Tn)
+    ar1[1] <- rnorm(1)
+    for (t in 2:Tn) ar1[t] <- country_ar1_rho_temp * ar1[t - 1] + rnorm(1, sd = sqrt(1 - country_ar1_rho_temp^2))
+    temp_i <- trend_i * seq_len(Tn) + loading_i * common_factor + ar1
+    temp_list[[i]] <- temp_i
+
+    # --- Verim: BAGIMSIZ trend + kendi AR(1)'i + heteroskedastik gurultu ---
+    # (sicaklikla veya ortak faktorle HICBIR baglantisi yok - H0 boylece dogru)
+    ytrend_i <- rnorm(1, yield_trend_slope_mean, yield_trend_slope_sd)
+    ar1y <- numeric(Tn)
+    ar1y[1] <- rnorm(1)
+    for (t in 2:Tn) ar1y[t] <- country_ar1_rho_yield * ar1y[t - 1] + rnorm(1, sd = sqrt(1 - country_ar1_rho_yield^2))
+    hetero_sd <- 1 + heterosked_slope * seq_len(Tn)
+    yield_i <- 100 + ytrend_i * seq_len(Tn) + ar1y * hetero_sd
+    yield_list[[i]] <- yield_i
+  }
+
+  list(temp = temp_list, yield = yield_list)
+}
+
+run_nullA_on_world <- function(world, B_pooled = SIM_B_POOLED) {
+  n_countries <- length(world$temp)
+  obs_list <- numeric(n_countries)
+  null_list <- list()
+  for (i in seq_len(n_countries)) {
+    temp_i <- world$temp[[i]]; yield_i <- world$yield[[i]]
+    t_index <- seq_along(yield_i)
+    yield_detrend <- residuals(lm(yield_i ~ t_index))
+    rec_temp <- count_records(temp_i, "upper"); rec_temp[1] <- 0L
+    rec_yield <- count_records(yield_detrend, "lower"); rec_yield[1] <- 0L
+    obs_list[i] <- sum(rec_temp * rec_yield)
+    null_list[[i]] <- circular_shift_null(temp_i, yield_detrend, n_shift = length(temp_i) - 1)
+  }
+  observed_total <- sum(obs_list)
+  pooled_null <- numeric(B_pooled)
+  for (b in seq_len(B_pooled)) {
+    tot <- 0
+    for (i in seq_len(n_countries)) tot <- tot + sample(null_list[[i]], 1)
+    pooled_null[b] <- tot
+  }
+  perm_pvalue(pooled_null, observed_total)
+}
+
+run_nullB_on_world <- function(world) {
+  n_countries <- length(world$temp)
+  Tn <- length(world$temp[[1]])
+  yield_rec_list <- list()
+  observed_total <- 0
+  for (i in seq_len(n_countries)) {
+    temp_i <- world$temp[[i]]; yield_i <- world$yield[[i]]
+    t_index <- seq_along(yield_i)
+    yield_detrend <- residuals(lm(yield_i ~ t_index))
+    rec_temp <- count_records(temp_i, "upper"); rec_temp[1] <- 0L
+    rec_yield <- count_records(yield_detrend, "lower"); rec_yield[1] <- 0L
+    observed_total <- observed_total + sum(rec_temp * rec_yield)
+    yield_rec_list[[i]] <- rec_yield
+  }
+  n_shift <- Tn - 1
+  sync_null <- numeric(n_shift)
+  for (k in seq_len(n_shift)) {
+    tot <- 0
+    for (i in seq_len(n_countries)) {
+      temp_shift <- world$temp[[i]][((seq_len(Tn) - 1 + k) %% Tn) + 1]
+      rec_temp_shift <- count_records(temp_shift, "upper"); rec_temp_shift[1] <- 0L
+      tot <- tot + sum(rec_temp_shift * yield_rec_list[[i]])
+    }
+    sync_null[k] <- tot
+  }
+  perm_pvalue(sync_null, observed_total)
+}
+
+set.seed(4242)
+sim_results <- data.frame(rep = integer(0), p_nullA = numeric(0), p_nullB = numeric(0))
+for (r in seq_len(SIM_N_REPS)) {
+  world <- simulate_one_world()
+  pA <- run_nullA_on_world(world)
+  pB <- run_nullB_on_world(world)
+  sim_results <- rbind(sim_results, data.frame(rep = r, p_nullA = pA, p_nullB = pB))
+  if (r %% 25 == 0) cat("Simulasyon", r, "/", SIM_N_REPS, "tamamlandi\n")
+}
+
+type1_summary <- data.frame(
+  null = c("Null A", "Null B"),
+  n_reps = SIM_N_REPS,
+  rejection_rate_at_0.05 = c(mean(sim_results$p_nullA < 0.05), mean(sim_results$p_nullB < 0.05)),
+  mean_p = c(mean(sim_results$p_nullA), mean(sim_results$p_nullB)),
+  median_p = c(median(sim_results$p_nullA), median(sim_results$p_nullB))
+)
+
+wbT1 <- createWorkbook()
+addWorksheet(wbT1, "type1_error_raw")
+writeData(wbT1, "type1_error_raw", sim_results)
+addWorksheet(wbT1, "type1_error_summary")
+writeData(wbT1, "type1_error_summary", type1_summary)
+saveWorkbook(wbT1, file.path(out_dir, "type1_error_simulation.xlsx"), overwrite = TRUE)
+
+cat("\n=== TYPE-I HATA SIMULASYONU SONUCU ===\n")
+cat("(Eger null dogru kalibre ediyorsa, rejection_rate_at_0.05 ~ 0.05 civarinda olmali)\n")
+print(type1_summary, row.names = FALSE)
