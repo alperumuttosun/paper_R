@@ -1286,3 +1286,91 @@ saveWorkbook(wbT1, file.path(out_dir, "type1_error_simulation.xlsx"), overwrite 
 cat("\n=== TYPE-I HATA SIMULASYONU SONUCU ===\n")
 cat("(Eger null dogru kalibre ediyorsa, rejection_rate_at_0.05 ~ 0.05 civarinda olmali)\n")
 print(type1_summary, row.names = FALSE)
+
+##################################################
+# TYPE-I HATA SIMULASYONU - 5 SENARYOLU IZGARA
+#
+# Amac: Tek bir DGP'ye (yukaridaki "orta" senaryo) bagli kalmak yerine,
+# bagimlilik gucunun ZAYIFTAN COK GUCLUYE bes farkli seviyesinde
+# Null A ve Null B'nin Tip-I hata oranini olcmek. Boylece "27.8%/11.6%
+# sonucu tek bir keyfi DGP'ye mi bagli" elestirisine ampirik cevap
+# veriyoruz.
+#
+# S3 senaryosu, yukarida zaten calistirdigimiz "tek senaryo" ile AYNI
+# parametreleri kullanir (dogrulama/tutarlilik kontrolu icin) - S3'un
+# sonucu yukaridaki type1_summary'deki sayilarla yakin cikmali.
+#
+# ONEMLI: Bu bolum yukaridaki tek-senaryo simulasyonunun 5 KATI kadar
+# hesaplama yapar. Tek senaryo ~7-15 dakika surduyse, bu bolum
+# ~35-75 dakika surebilir. Once kucuk bir SIM_N_REPS (orn. 20) ile
+# deneyip sureyi olcmenizi, sonra tam calistirmanizi oneririm.
+##################################################
+
+scenario_grid <- data.frame(
+  scenario = c("S1_minimal", "S2_low", "S3_medium", "S4_high", "S5_very_high"),
+  common_factor_sd = c(0, 0.3, 1.0, 1.5, 2.0),
+  ar_rho_temp = c(0.1, 0.2, 0.4, 0.6, 0.8),
+  ar_rho_yield = c(0.1, 0.15, 0.3, 0.45, 0.6),
+  trend_on = c(FALSE, TRUE, TRUE, TRUE, TRUE),
+  heterosked_on = c(FALSE, FALSE, TRUE, TRUE, TRUE),
+  stringsAsFactors = FALSE
+)
+
+cat("\n=== SENARYO IZGARASI ===\n")
+print(scenario_grid, row.names = FALSE)
+
+simulate_one_world_param <- function(n_countries, Tn, cf_sd, ar_temp, ar_yield, trend_on, heterosked_on) {
+  common_factor <- if (cf_sd > 0) cumsum(rnorm(Tn, sd = cf_sd / sqrt(Tn))) else rep(0, Tn)
+  temp_list <- list(); yield_list <- list()
+  for (i in seq_len(n_countries)) {
+    trend_i <- if (trend_on) rnorm(1, temp_trend_slope_mean, temp_trend_slope_sd) else 0
+    loading_i <- runif(1, 0.5, 1.5)
+    ar1 <- numeric(Tn); ar1[1] <- rnorm(1)
+    for (t in 2:Tn) ar1[t] <- ar_temp * ar1[t - 1] + rnorm(1, sd = sqrt(1 - ar_temp^2))
+    temp_list[[i]] <- trend_i * seq_len(Tn) + loading_i * common_factor + ar1
+
+    ytrend_i <- if (trend_on) rnorm(1, yield_trend_slope_mean, yield_trend_slope_sd) else 0
+    ar1y <- numeric(Tn); ar1y[1] <- rnorm(1)
+    for (t in 2:Tn) ar1y[t] <- ar_yield * ar1y[t - 1] + rnorm(1, sd = sqrt(1 - ar_yield^2))
+    hetero_sd <- if (heterosked_on) 1 + heterosked_slope * seq_len(Tn) else rep(1, Tn)
+    yield_list[[i]] <- 100 + ytrend_i * seq_len(Tn) + ar1y * hetero_sd
+  }
+  list(temp = temp_list, yield = yield_list)
+}
+
+set.seed(8181)
+grid_results <- data.frame()
+for (s in seq_len(nrow(scenario_grid))) {
+  sc <- scenario_grid[s, ]
+  cat(sprintf("\n--- Senaryo %s calisiyor (common_factor_sd=%.1f, ar_temp=%.1f) ---\n",
+              sc$scenario, sc$common_factor_sd, sc$ar_rho_temp))
+  p_nullA_vec <- numeric(SIM_N_REPS)
+  p_nullB_vec <- numeric(SIM_N_REPS)
+  for (r in seq_len(SIM_N_REPS)) {
+    world <- simulate_one_world_param(SIM_N_COUNTRIES, SIM_T, sc$common_factor_sd,
+                                       sc$ar_rho_temp, sc$ar_rho_yield, sc$trend_on, sc$heterosked_on)
+    p_nullA_vec[r] <- run_nullA_on_world(world)
+    p_nullB_vec[r] <- run_nullB_on_world(world)
+    if (r %% 50 == 0) cat("  ", sc$scenario, "-", r, "/", SIM_N_REPS, "tamamlandi\n")
+  }
+  grid_results <- rbind(grid_results, data.frame(
+    scenario = sc$scenario,
+    common_factor_sd = sc$common_factor_sd,
+    ar_rho_temp = sc$ar_rho_temp,
+    null = c("Null A", "Null B"),
+    n_reps = SIM_N_REPS,
+    rejection_rate_at_0.05 = c(mean(p_nullA_vec < 0.05), mean(p_nullB_vec < 0.05)),
+    mean_p = c(mean(p_nullA_vec), mean(p_nullB_vec)),
+    median_p = c(median(p_nullA_vec), median(p_nullB_vec))
+  ))
+}
+
+wbGrid <- createWorkbook()
+addWorksheet(wbGrid, "scenario_grid_definition")
+writeData(wbGrid, "scenario_grid_definition", scenario_grid)
+addWorksheet(wbGrid, "type1_error_grid_results")
+writeData(wbGrid, "type1_error_grid_results", grid_results)
+saveWorkbook(wbGrid, file.path(out_dir, "type1_error_scenario_grid.xlsx"), overwrite = TRUE)
+
+cat("\n=== 5 SENARYOLU TYPE-I HATA IZGARASI SONUCU ===\n")
+print(grid_results, row.names = FALSE)
