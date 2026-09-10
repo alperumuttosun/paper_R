@@ -1374,3 +1374,124 @@ saveWorkbook(wbGrid, file.path(out_dir, "type1_error_scenario_grid.xlsx"), overw
 
 cat("\n=== 5 SENARYOLU TYPE-I HATA IZGARASI SONUCU ===\n")
 print(grid_results, row.names = FALSE)
+
+##################################################
+# YAGIS (PRECIPITATION) DUYARLILIK ANALIZI - SADECE SORGUM
+#
+# Amac: Sicaklik-verim eszamanliligi sinyalinin, yagisi da (kuraklik)
+# hesaba katinca nasil degistigini gormek. Sadece sorgum icin (Null A'da
+# en guclu sinyali gosteren urun), full-sample, linear detrend.
+#
+# Ucuncul (trivariate) eszamanlilik gostergesi:
+#   C_i,t = 1  <=>  (sicaklik ust-rekoru) VE (yagis alt-rekoru) VE
+#                   (detrend edilmis verim alt-rekoru) AYNI ULKE-YILDA
+#
+# Sicaklik kaydiriliyor (Null A: ulkeye-ozel, Null B: senkronize),
+# yagis VE verim SABIT tutuluyor - ana analizdeki mantigin dogal
+# bir uzantisi. Yagis (PRE_ann) ham (detrend edilmemis) kullaniliyor,
+# tipki sicaklik gibi.
+##################################################
+
+cat("\n=== YAGIS DUYARLILIK ANALIZI (sadece sorgum) baslıyor ===\n")
+
+precip_crop <- "sorghum"
+raw_precip <- as.data.frame(read_excel(sprintf("panelv7_%s.xlsx", precip_crop)))
+raw_precip <- raw_precip[, c("Country_ISO", "Yil", "yield_hg_per_ha", "TMX_ann", "PRE_ann")]
+raw_precip <- raw_precip[order(raw_precip$Country_ISO, raw_precip$Yil), ]
+
+full_years <- YEAR_START:YEAR_END
+keep_precip <- c()
+for (ctry in unique(raw_precip$Country_ISO)) {
+  sub <- raw_precip[raw_precip$Country_ISO == ctry, ]
+  if (nrow(sub) < 64) next
+  if (any(is.na(sub$yield_hg_per_ha)) || any(is.na(sub$TMX_ann)) || any(is.na(sub$PRE_ann))) next
+  if (!all(full_years %in% sub$Yil)) next
+  keep_precip <- c(keep_precip, ctry)
+}
+df_precip <- raw_precip[raw_precip$Country_ISO %in% keep_precip, ]
+cat("Yagis analizi icin full-sample ulke sayisi (sorghum):", length(keep_precip), "\n")
+
+# --- Her ulke icin ucuncul (trivariate) gozlem sayisi ve Null A/B icin null dagilimlari ---
+obs_list_p <- numeric(0)
+nullA_list_p <- list()
+yield_rec_list_p <- list()
+temp_list_p <- list()
+observed_total_B_p <- 0
+
+for (ctry in unique(df_precip$Country_ISO)) {
+  sub <- df_precip[df_precip$Country_ISO == ctry, ]
+  yield_raw <- sub$yield_hg_per_ha
+  temp_raw <- sub$TMX_ann
+  precip_raw <- sub$PRE_ann
+  t_index <- seq_along(yield_raw)
+  yield_detrend <- residuals(lm(yield_raw ~ t_index))
+
+  rec_temp <- count_records(temp_raw, "upper"); rec_temp[1] <- 0L
+  rec_yield <- count_records(yield_detrend, "lower"); rec_yield[1] <- 0L
+  rec_precip <- count_records(precip_raw, "lower"); rec_precip[1] <- 0L
+
+  # Ucuncul (trivariate) gozlenen eszamanlilik: uc gostergenin carpimi
+  triple_indicator <- rec_yield * rec_precip  # sicaklik disinda sabit tutulan kisim
+  obs_i <- sum(rec_temp * triple_indicator)
+  obs_list_p <- c(obs_list_p, obs_i)
+  observed_total_B_p <- observed_total_B_p + obs_i
+
+  # Null A icin: sicakligi kaydir, yagis+verim sabit (triple_indicator sabit)
+  n_i <- length(temp_raw)
+  null_i <- integer(n_i - 1)
+  for (k in seq_len(n_i - 1)) {
+    temp_shift <- temp_raw[((seq_len(n_i) - 1 + k) %% n_i) + 1]
+    rec_temp_shift <- count_records(temp_shift, "upper"); rec_temp_shift[1] <- 0L
+    null_i[k] <- sum(rec_temp_shift * triple_indicator)
+  }
+  nullA_list_p[[ctry]] <- null_i
+  yield_rec_list_p[[ctry]] <- triple_indicator
+  temp_list_p[[ctry]] <- temp_raw
+}
+
+observed_total_A_p <- sum(obs_list_p)
+
+# Null A pooled test (Monte Carlo, B_pooled cekimi)
+set.seed(2026)
+pooled_null_A_p <- integer(B_pooled)
+for (b in seq_len(B_pooled)) {
+  tot <- 0
+  for (ctry in names(nullA_list_p)) tot <- tot + sample(nullA_list_p[[ctry]], 1)
+  pooled_null_A_p[b] <- tot
+}
+p_value_A_precip <- perm_pvalue(pooled_null_A_p, observed_total_A_p)
+CR_A_precip <- observed_total_A_p / mean(pooled_null_A_p)
+
+# Null B pooled test (senkronize, T-1 = 63 kaydirma, exact enumeration)
+n_shift_p <- YEAR_END - YEAR_START  # 63
+sync_null_p <- integer(n_shift_p)
+n_years_p <- YEAR_END - YEAR_START + 1
+for (k in seq_len(n_shift_p)) {
+  tot <- 0
+  for (ctry in names(temp_list_p)) {
+    temp_shift <- temp_list_p[[ctry]][((seq_len(n_years_p) - 1 + k) %% n_years_p) + 1]
+    rec_temp_shift <- count_records(temp_shift, "upper"); rec_temp_shift[1] <- 0L
+    tot <- tot + sum(rec_temp_shift * yield_rec_list_p[[ctry]])
+  }
+  sync_null_p[k] <- tot
+}
+p_value_B_precip <- perm_pvalue(sync_null_p, observed_total_B_p)
+CR_B_precip <- observed_total_B_p / mean(sync_null_p)
+
+precip_results <- data.frame(
+  crop = precip_crop,
+  n_countries = length(keep_precip),
+  null = c("Null A", "Null B"),
+  observed_total = c(observed_total_A_p, observed_total_B_p),
+  null_mean = c(mean(pooled_null_A_p), mean(sync_null_p)),
+  CR = c(CR_A_precip, CR_B_precip),
+  p_value = c(p_value_A_precip, p_value_B_precip)
+)
+
+wbPrecip <- createWorkbook()
+addWorksheet(wbPrecip, "precipitation_sensitivity")
+writeData(wbPrecip, "precipitation_sensitivity", precip_results)
+saveWorkbook(wbPrecip, file.path(out_dir, "precipitation_sensitivity_sorghum.xlsx"), overwrite = TRUE)
+
+cat("\n=== YAGIS DUYARLILIK ANALIZI SONUCU (sorghum, trivariate: TMX ust-rekor + PRE alt-rekor + verim alt-rekor) ===\n")
+print(precip_results, row.names = FALSE)
