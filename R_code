@@ -1495,3 +1495,135 @@ saveWorkbook(wbPrecip, file.path(out_dir, "precipitation_sensitivity_sorghum.xls
 
 cat("\n=== YAGIS DUYARLILIK ANALIZI SONUCU (sorghum, trivariate: TMX ust-rekor + PRE alt-rekor + verim alt-rekor) ===\n")
 print(precip_results, row.names = FALSE)
+
+
+##################################################
+# BLOK YENIDEN ORNEKLEME (BLOCK-RESAMPLING) DUYARLILIK KONTROLU
+# (Bu script tamamen bagimsizdir, tek basina calistirilabilir)
+#
+# Amac: Null A'nin (ulkeye-ozel dairesel kaydirma) sonuclarinin,
+# "8 uzunlugunda bitisik bloklari yerine koyarak orneklemek" gibi
+# FARKLI bir null insaasi altinda da benzer kalip verip vermedigini
+# kontrol etmek. Sadece sorgum ve misir icin (Null A'da anlamli
+# cikan iki urun), full-sample, linear detrend.
+#
+# Blok yeniden orneklemesi: 64 yillik seriden uzunluk-8 bloklar
+# (kaydirmali, 1..57 arasi baslangic noktalarindan) yerine koyarak
+# 8 kez cekilir ve uc uca eklenerek 64-uzunlugunda yeni bir seri
+# olusturulur. Bu, orijinal seriden FARKLI olarak bazi yillari
+# tekrar edip bazilarini atlayabilir (circular-shift'ten farkli
+# olarak marjinal dagilimi degistirebilir).
+##################################################
+
+library(readxl)
+library(openxlsx)
+
+base_dir <- "C:/Users/Alper.Tosun/Desktop/cru130"
+setwd(base_dir)
+out_dir <- file.path(base_dir, "record_montecarlo", "results")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+YEAR_START <- 1961
+YEAR_END <- 2024
+B_pooled <- 10000
+BLOCK_LEN <- 8
+set.seed(4242)
+
+count_records <- function(x, type = c("upper", "lower")) {
+  type <- match.arg(type)
+  n <- length(x); rec <- integer(n); rec[1] <- 1L; running <- x[1]
+  if (type == "upper") { for (t in 2:n) if (x[t] > running) { rec[t] <- 1L; running <- x[t] } }
+  else { for (t in 2:n) if (x[t] < running) { rec[t] <- 1L; running <- x[t] } }
+  rec
+}
+perm_pvalue <- function(null_dist, observed) (1 + sum(null_dist >= observed)) / (1 + length(null_dist))
+
+block_resample_series <- function(x, block_len = BLOCK_LEN) {
+  n <- length(x)
+  n_blocks <- ceiling(n / block_len)
+  max_start <- n - block_len + 1
+  starts <- sample(seq_len(max_start), n_blocks, replace = TRUE)
+  out <- unlist(lapply(starts, function(s) x[s:(s + block_len - 1)]))
+  out[seq_len(n)]
+}
+
+run_block_resampling_crop <- function(crop) {
+  raw <- as.data.frame(read_excel(sprintf("panelv7_%s.xlsx", crop)))
+  raw <- raw[, c("Country_ISO", "Yil", "yield_hg_per_ha", "TMX_ann")]
+  raw <- raw[order(raw$Country_ISO, raw$Yil), ]
+
+  full_years <- YEAR_START:YEAR_END
+  keep <- c()
+  for (ctry in unique(raw$Country_ISO)) {
+    sub <- raw[raw$Country_ISO == ctry, ]
+    if (nrow(sub) < 64) next
+    if (any(is.na(sub$yield_hg_per_ha)) || any(is.na(sub$TMX_ann))) next
+    if (!all(full_years %in% sub$Yil)) next
+    keep <- c(keep, ctry)
+  }
+  df <- raw[raw$Country_ISO %in% keep, ]
+  cat(sprintf("  %s: full-sample ulke sayisi = %d\n", crop, length(keep)))
+
+  yield_rec_list <- list()
+  temp_list <- list()
+  observed_total <- 0
+
+  for (ctry in unique(df$Country_ISO)) {
+    sub <- df[df$Country_ISO == ctry, ]
+    yield_raw <- sub$yield_hg_per_ha
+    temp_raw <- sub$TMX_ann
+    t_index <- seq_along(yield_raw)
+    yield_detrend <- residuals(lm(yield_raw ~ t_index))
+
+    rec_temp <- count_records(temp_raw, "upper"); rec_temp[1] <- 0L
+    rec_yield <- count_records(yield_detrend, "lower"); rec_yield[1] <- 0L
+
+    observed_total <- observed_total + sum(rec_temp * rec_yield)
+    yield_rec_list[[ctry]] <- rec_yield
+    temp_list[[ctry]] <- temp_raw
+  }
+
+  # Havuzlanmis Monte Carlo null: her replikasyonda HER ulke icin
+  # BAGIMSIZ bir blok-yeniden-orneklemesi cekilir (Null A'nin
+  # ulkeye-ozel bagimsizlik mantigiyla tutarli), toplam eszamanlilik
+  # sayisi ulkeler arasinda toplanir.
+  pooled_null <- integer(B_pooled)
+  ctry_names <- names(temp_list)
+  for (b in seq_len(B_pooled)) {
+    tot <- 0
+    for (ctry in ctry_names) {
+      temp_resampled <- block_resample_series(temp_list[[ctry]])
+      rec_temp_r <- count_records(temp_resampled, "upper"); rec_temp_r[1] <- 0L
+      tot <- tot + sum(rec_temp_r * yield_rec_list[[ctry]])
+    }
+    pooled_null[b] <- tot
+  }
+
+  p_value <- perm_pvalue(pooled_null, observed_total)
+  CR <- observed_total / mean(pooled_null)
+
+  data.frame(crop = crop, n_countries = length(keep), method = "block_resampling",
+             observed_total = observed_total, null_mean = mean(pooled_null),
+             CR = CR, p_value = p_value)
+}
+
+cat("\n=== BLOK YENIDEN ORNEKLEME DUYARLILIK KONTROLU basliyor (sorgum, misir) ===\n")
+cat("UYARI: bu B_pooled=10000 ile HER ulke icin ayri blok-orneklemesi cektigi icin\n")
+cat("yavas olabilir (birkac dakika surebilir).\n\n")
+
+results_sorghum <- run_block_resampling_crop("sorghum")
+results_maize <- run_block_resampling_crop("maize")
+
+block_results <- rbind(results_sorghum, results_maize)
+
+wbBlock <- createWorkbook()
+addWorksheet(wbBlock, "block_resampling")
+writeData(wbBlock, "block_resampling", block_results)
+saveWorkbook(wbBlock, file.path(out_dir, "block_resampling_sensitivity.xlsx"), overwrite = TRUE)
+
+cat("\n=== BLOK YENIDEN ORNEKLEME SONUCU (sorghum, maize, Null A karsilastirmasi icin) ===\n")
+print(block_results, row.names = FALSE)
+cat("\nKaydedildi:", file.path(out_dir, "block_resampling_sensitivity.xlsx"), "\n")
+cat("\nKarsilastirma icin Null A (circular-shift) referans degerleri:\n")
+cat("  Sorghum: CR=1.326, p=0.0024\n")
+cat("  Maize:   CR=1.184, p=0.0086\n")
